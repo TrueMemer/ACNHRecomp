@@ -155,8 +155,18 @@ static bool block(std::unique_lock<std::recursive_mutex>& lk, KThread* self, int
     return self->cv.wait_until(lk, until, [&] { return self->wake; });
 }
 
+// Record the matching signal under g_k and emit slow waits after releasing it.
+static bool trace_condvar() {
+    static const bool enabled = std::getenv("NX_TRACE_CONDVAR") != nullptr;
+    return enabled;
+}
+
 // Wake a blocked thread (with g_k held).
 static void wake(KThread* t) {
+    if (t->condvar_trace.start_ns) {
+        t->condvar_trace.wake_ns = plat::monotonic_ns();
+        t->condvar_trace.waker_tid = t_self ? t_self->host_tid : plat::current_thread_id();
+    }
     t->wake = true;
     t->wait_result = 0;
     if (DeferredWakes* d = t_wakes; d && deferred_wakes_on())
@@ -217,7 +227,8 @@ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
     return 0;
 }
 
-static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
+static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout,
+                                               uint64_t pc) {
     DeferredWakes wakes;  // sent after lk is released
     std::unique_lock lk(g_k);
     KThread* self = t_self;
@@ -229,21 +240,42 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     self->wait_key = key;
     self->wait_tag = tag;
     self->wait_result = 0;
+    if (trace_condvar()) self->condvar_trace.start_ns = plat::monotonic_ns();
     g_cv_waiters.push_back(self);
     store32(key, 1);
     unlock_mutex(mutex);
-    if (block(lk, self, timeout)) return self->wait_result;
-    // Timed out (not handed the mutex): leave the condvar, or the mutex queue a signal moved us to, and return
-    // without the mutex. Like Horizon: the SDK re-locks it itself (TimedWait -> InternalCriticalSection::Enter);
-    // returning with it held made that Enter wait on ourselves forever.
-    remove(g_cv_waiters, self);
-    remove(g_mutex_waiters, self);
-    bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
-    if (!others) store32(key, 0);
-    return 0xEA01;
+    const bool woken = block(lk, self, timeout);
+    uint32_t result = self->wait_result;
+    if (!woken) {
+        // Horizon returns without the mutex on timeout. The SDK re-locks it itself.
+        remove(g_cv_waiters, self);
+        remove(g_mutex_waiters, self);
+        bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
+        if (!others) store32(key, 0);
+        result = 0xEA01;
+    }
+    if (self->condvar_trace.start_ns) {
+        const auto trace = self->condvar_trace;
+        self->condvar_trace = {};
+        const uint64_t end = plat::monotonic_ns();
+        lk.unlock();
+        if (end - trace.start_ns >= 10'000'000) {
+            log("condvar: end_ns=%llu wait=%.2fms key=%#llx waiter=g%llx tid=%lld pc=%#llx lr=%#llx "
+                "signal_ns=%llu signaler=g%llx tid=%lld pc=%#llx lr=%#llx entry=%#llx "
+                "wake_ns=%llu waker_tid=%lld result=%#x",
+                (unsigned long long)end, double(end - trace.start_ns) / 1e6, (unsigned long long)key,
+                (unsigned long long)self->id, (long long)self->host_tid, (unsigned long long)pc,
+                (unsigned long long)self->ctx.x[30],
+                (unsigned long long)trace.signal_ns, (unsigned long long)trace.signaler_id,
+                (long long)trace.signaler_tid, (unsigned long long)trace.signal_pc, (unsigned long long)trace.signal_lr,
+                (unsigned long long)trace.signal_entry, (unsigned long long)trace.wake_ns,
+                (long long)trace.waker_tid, result);
+        }
+    }
+    return result;
 }
 
-static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
+static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count, uint64_t pc) {
     DeferredWakes wakes;  // sent after lk is released
     std::unique_lock lk(g_k);
     int n = 0;
@@ -252,6 +284,15 @@ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
         if (t->wait_key != key) {
             i++;
             continue;
+        }
+        if (t->condvar_trace.start_ns) {
+            auto& trace = t->condvar_trace;
+            trace.signal_ns = plat::monotonic_ns();
+            trace.signaler_id = t_self->id;
+            trace.signaler_tid = t_self->host_tid;
+            trace.signal_pc = pc;
+            trace.signal_lr = t_self->ctx.x[30];
+            trace.signal_entry = t_self->entry;
         }
         g_cv_waiters.erase(g_cv_waiters.begin() + i);
         n++;
@@ -653,10 +694,10 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
             rc = svc_arbitrate_unlock(c.x[0]);
             break;
         case 0x1C:
-            rc = svc_wait_process_wide_key(c.x[0], c.x[1], uint32_t(c.x[2]), int64_t(c.x[3]));
+            rc = svc_wait_process_wide_key(c.x[0], c.x[1], uint32_t(c.x[2]), int64_t(c.x[3]), pc);
             break;
         case 0x1D:
-            rc = svc_signal_process_wide_key(c.x[0], int32_t(c.x[1]));
+            rc = svc_signal_process_wide_key(c.x[0], int32_t(c.x[1]), pc);
             break;
         case 0x1E:  // GetSystemTick
             c.x[0] = system_tick();

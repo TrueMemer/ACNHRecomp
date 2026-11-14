@@ -6,6 +6,7 @@
 #
 # usage: tools/build_android.sh [--install] [--jobs N] [--no-game]
 #   --no-game: the app only, without the game set up here (what a release carries)
+#   --trace-apk: installable alongside the release, with symbols retained in the build directory
 #   the Vulkan headers: private/third_party/Vulkan-Headers-1.4.357 (tools/setup_acnh.sh; the NDK's are older than
 #   what the runtime calls)
 #   needs: Android SDK with ndk;28.2.13676358, build-tools;35.0.0, platforms;android-35 (ANDROID_SDK_ROOT, default
@@ -41,11 +42,13 @@ if [ -z "${JOBS:-}" ]; then
   [ "$JOBS" -lt 1 ] && JOBS=1
 fi
 GAMELIB=1
+TRACE_APK=0
 while [ $# -gt 0 ]; do
   case $1 in
     --install) INSTALL=1 ;;
     --jobs) JOBS=$2; shift ;;
     --no-game) GAMELIB=0 ;;
+    --trace-apk) TRACE_APK=1 ;;
     *) echo "unknown option $1"; exit 1 ;;
   esac
   shift
@@ -60,10 +63,16 @@ elif [ ! -d "$GEN/main" ]; then
   echo "the game is not set up on this computer (python3 tools/setup_acnh.py --game <folder>); --no-game: the app only"
   exit 1
 fi
+BUILD_TYPE=Release
+if [ "$TRACE_APK" = 1 ]; then
+  BUILD="$BUILD-trace"
+  OUT="$OUT-trace"
+  BUILD_TYPE=RelWithDebInfo
+fi
 mkdir -p "$(dirname "$OUT")"
 
 echo "== configure ($BUILD)"
-cmake -S . -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
   -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a -DANDROID_STL=c++_shared \
   -DANDROID_PLATFORM=android-29 -DNX_GAME=$GAME -DNX_GEN_DIR="$GEN" -DNX_LAUNCHER=OFF \
   -DNX_VULKAN_SDK="$PWD/private/third_party/Vulkan-Headers-1.4.357" > "$OUT.cmake.log" 2>&1 ||
@@ -104,7 +113,14 @@ VNAME=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//'); VNAME=${VNAM
 IFS=. read -r VMAJ VMIN VPAT <<<"${VNAME%%-*}"
 VCODE=$(( ${VMAJ:-0} * 10000 + ${VMIN:-0} * 100 + ${VPAT:-0} ))
 echo "APK version $VNAME ($VCODE)"
-"$BT/aapt2" link -o "$OUT/base.apk" --manifest android/AndroidManifest.xml -I "$PLATFORM" "$OUT/res.zip" \
+MANIFEST=android/AndroidManifest.xml
+LINK_FLAGS=()
+if [ "$TRACE_APK" = 1 ]; then
+  MANIFEST="$OUT/AndroidManifest.xml"
+  sed 's/android:label="ACNH Recomp"/android:label="ACNH Recomp Trace" android:debuggable="true"/'     android/AndroidManifest.xml > "$MANIFEST"
+  LINK_FLAGS+=(--rename-manifest-package io.github.acnhrecomp.trace)
+fi
+"$BT/aapt2" link -o "$OUT/base.apk" --manifest "$MANIFEST" -I "$PLATFORM" "$OUT/res.zip" "${LINK_FLAGS[@]}" \
   --version-name "$VNAME" --version-code "$VCODE" --replace-version
 # The pt-BR translation and the SpeedFix files as assets, which the app copies into the game folder (mod_fetch.cpp).
 rm -rf "${OUT:?}/assets"

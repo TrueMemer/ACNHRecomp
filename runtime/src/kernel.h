@@ -35,6 +35,11 @@ struct KThread : KObject {
     uint32_t wait_result = 0;
     uint64_t wait_mutex = 0, wait_key = 0, wait_addr = 0;
     uint32_t wait_tag = 0;
+    struct {
+        uint64_t start_ns = 0, signal_ns = 0, wake_ns = 0;
+        uint64_t signaler_id = 0, signal_pc = 0, signal_lr = 0, signal_entry = 0;
+        int64_t signaler_tid = 0, waker_tid = 0;
+    } condvar_trace;
     std::condition_variable_any cv;  // this thread's own wake-up (with the kernel lock)
     bool signaled() const override { return exited; }
 };
