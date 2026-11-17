@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "nvn_shaders.h"
+#include "nvn_present_cadence.h"
 #include "nvn_ultrawide.h"
 #include "nvn_vk.h"
 #include "ui/ui.h"
@@ -33,6 +34,7 @@
 
 namespace nx {
 void vblank_hold();  // hle_vi.cpp: waits for the vblank before the one the image is due at
+uint64_t tick_period_ns();
 }
 
 namespace nx::nvn {
@@ -73,6 +75,13 @@ bool g_dynamic_rendering = true;  // vkCmdBeginRendering usable (core 1.3 or VK_
 bool g_intel_windows_legacy = false;
 std::atomic<bool> g_fifo{false};    // the swapchain presents in FIFO (VSync): present_vsync_paced
 bool g_display_timing = false;      // VK_GOOGLE_display_timing enabled
+#if defined(__ANDROID__)
+bool g_mali_display_timing = false;
+std::atomic<uint64_t> g_buffered_refresh{0};
+uint64_t g_refresh_checked = 0;
+PresentCadence g_present_cadence;
+#endif
+uint64_t g_last_real_shown = 0, g_refresh_ns = 0;
 bool g_integrated = false;
 bool g_nvidia = false;  // the device's vendor is NVIDIA (the settings screen offers DLSS)
 bool g_require_sg32 = false;  // compute pipelines are made with a required subgroup size of 32 (Maxwell's warp)  // the chosen GPU is an integrated one (unified memory, the GPU is the long side)
@@ -316,6 +325,9 @@ bool init() {
     if (has_extension(dext, "VK_GOOGLE_display_timing")) {  // when frames reach the screen (display_timing_log)
         dexts.push_back("VK_GOOGLE_display_timing");
         g_display_timing = true;
+#if defined(__ANDROID__)
+        g_mali_display_timing = props.vendorID == 0x13B5;
+#endif
     }
     if (has_extension(dext, "VK_EXT_depth_clip_control")) {
         dexts.push_back("VK_EXT_depth_clip_control");
@@ -596,6 +608,16 @@ bool make_hudless_images(VkExtent2D extent) {
     return true;
 }
 
+#if defined(__ANDROID__)
+void update_buffered_refresh(uint64_t now) {
+    if (!g_mali_display_timing || !g_fifo.load() || !p_vkGetRefreshCycleDurationGOOGLE) return;
+    VkRefreshCycleDurationGOOGLE refresh{};
+    const VkResult result = p_vkGetRefreshCycleDurationGOOGLE(g_device, g_swapchain, &refresh);
+    g_buffered_refresh.store(result == VK_SUCCESS ? refresh.refreshDuration : 0, std::memory_order_relaxed);
+    g_refresh_checked = now;
+}
+#endif
+
 bool make_swapchain() {
     presenter_idle();
     ui::ui_swapchain_changed();
@@ -699,6 +721,12 @@ bool make_swapchain() {
     } else if (!check(p_vkCreateSwapchainKHR(g_device, &ci, nullptr, &g_swapchain), "vkCreateSwapchainKHR")) {
         return false;
     }
+    g_last_real_shown = g_refresh_ns = 0;
+#if defined(__ANDROID__)
+    g_present_cadence.reset();
+    g_buffered_refresh.store(0, std::memory_order_relaxed);
+    update_buffered_refresh(plat::monotonic_ns());
+#endif
     uint32_t n = 0;
     if (ffx_fg_on()) {
         ffx_fg_get_images(g_swapchain, &n, nullptr);
@@ -1076,8 +1104,32 @@ namespace {
 // refreshes each frame stayed (at 30 fps on a 60 Hz display: 2 each, when it is smooth).
 uint32_t g_present_id = 0;
 std::vector<uint8_t> g_present_real(4096);
-uint64_t g_last_real_shown = 0, g_refresh_ns = 0;
 uint64_t g_shown_for[6] = {};  // 1, 2, 3, 4, 5, 6+ refreshes
+
+bool vsync_pacing_disabled() {
+    static const bool off = std::getenv("NX_VSYNC_PACING") && std::getenv("NX_VSYNC_PACING")[0] == '0';
+    return off;
+}
+
+#if defined(__ANDROID__)
+// On Mali, use the game timer and a display deadline for 30 FPS when it fits the panel's refresh period.
+// This holds each frame on screen at the same cadence without submitting copies to fill the intervening vblanks.
+uint64_t buffered_period(int interval, uint64_t refresh) {
+    if (interval != 2 || !refresh || !g_fifo.load() || vsync_pacing_disabled() || framegen_wanted()) return 0;
+    const uint64_t target = uint64_t(interval) * tick_period_ns();
+    const uint64_t period = ((target + refresh / 2) / refresh) * refresh;
+    const uint64_t difference = period > target ? period - target : target - period;
+    return difference <= target / 30 ? period : 0;
+}
+
+uint64_t buffered_present_time(int interval) {
+    const uint64_t refresh = g_buffered_refresh.load(std::memory_order_relaxed);
+    if (const uint64_t period = buffered_period(interval, refresh))
+        return g_present_cadence.next(plat::monotonic_ns(), refresh, period, g_last_real_shown);
+    g_present_cadence.reset();
+    return 0;
+}
+#endif
 
 uint32_t display_timing_next(bool real) {
     uint32_t id = ++g_present_id;
@@ -1250,7 +1302,7 @@ struct PresentParts {
 // is one of the game's frames: those are counted and dumped), the present pass or the blit of it, the settings screen,
 // the submit and the present.
 template <class Record>
-void present_image(const int32_t* crop, Record&& record) {
+void present_image(const int32_t* crop, Record&& record, [[maybe_unused]] int interval = 0) {
     presenter_wait();
     if (!g_swapchain) return;
     uint32_t index = 0;
@@ -1349,8 +1401,11 @@ void present_image(const int32_t* crop, Record&& record) {
         end_and_wait(acquired, rendered);
     // Handed to the presenter thread: game frames, and on Android without frame generation their repeats too.
 #if defined(__ANDROID__)
-    const bool handed = presenter_wanted() && (real || !framegen_wanted()), fence_own = handed && real;
+    const uint64_t desired_time = real ? buffered_present_time(interval) : 0;
+    const bool handed = presenter_wanted() && (real || !framegen_wanted());
+    const bool fence_own = handed && real && !desired_time;
 #else
+    const uint64_t desired_time = 0;
     const bool handed = presenter_wanted() && real, fence_own = false;
 #endif
     // A fence behind the generated image (see g_gen_fence); without frame generation behind the game frame, for its
@@ -1377,10 +1432,10 @@ void present_image(const int32_t* crop, Record&& record) {
         picture = (dump && probe && frame_readback_lit(*src)) || plat::monotonic_ns() - first_ns > 60'000'000'000ull;
         shown_now = picture;
     }
-    VkPresentTimeGOOGLE when{uint32_t(display_timing_next(real)), 0};
+    VkPresentTimeGOOGLE when{uint32_t(display_timing_next(real)), desired_time};
     // On the display's vblank its interval asks for (hle_vi.cpp). Not with AMD frame generation: its swapchain paces
     // the game's frames and its own between them; both holding cost a 60 fps game a third of its frames (40 fps).
-    if (real && !ffx_fg_on()) vblank_hold();
+    if (real && !desired_time && !ffx_fg_on()) vblank_hold();
     parts.mark(3);
     if (handed) {
         // The fence is for the image after this one (the repeat) when it is this frame's own.
@@ -1445,9 +1500,12 @@ bool refresh_is_multiple_of_60() {
     return k >= 1 && std::fabs(r - double(k)) <= 0.03 * double(k);
 }
 
-bool present_vsync_paced() {
-    static const bool off = std::getenv("NX_VSYNC_PACING") && std::getenv("NX_VSYNC_PACING")[0] == '0';
-    return !off && g_fifo.load() && !framegen_wanted() && !plat::headless() && refresh_is_multiple_of_60();
+bool present_vsync_paced([[maybe_unused]] int interval) {
+#if defined(__ANDROID__)
+    if (buffered_period(interval, g_buffered_refresh.load(std::memory_order_relaxed))) return false;
+#endif
+    return !vsync_pacing_disabled() && g_fifo.load() && !framegen_wanted() && !plat::headless() &&
+           refresh_is_multiple_of_60();
 }
 
 void gpu_present(uint64_t texture, const int32_t* crop, int interval) {
@@ -1497,6 +1555,12 @@ void gpu_present(uint64_t texture, const int32_t* crop, int interval) {
         log("nvn/vk: frame generation turned %s: swapchain made again", ffx_fg_should() ? "on" : "off");
     }
     if (!g_swapchain && !make_swapchain()) return;
+#if defined(__ANDROID__)
+    if (g_mali_display_timing && g_fifo.load()) {
+        const uint64_t now = plat::monotonic_ns();
+        if (now - g_refresh_checked >= 1'000'000'000) update_buffered_refresh(now);
+    }
+#endif
     GpuImage* src = image_of(texture);
     int32_t src_crop[4];  // the game's crop, on the window texture's size (a resized screen target, nvn_ultrawide.cpp)
     if (crop && src) uw_crop(*src, crop, src_crop), crop = src_crop;
@@ -1526,10 +1590,10 @@ void gpu_present(uint64_t texture, const int32_t* crop, int interval) {
         present_image(crop, [&](VkCommandBuffer, bool&) { return src; });  // not replayed into meanwhile (same thread)
         return;
     }
-    present_image(crop, [&](VkCommandBuffer, bool&) { return src; });
+    present_image(crop, [&](VkCommandBuffer, bool&) { return src; }, interval);
     // A display faster than the game: the frame again each refresh between two. Not with AMD frame generation, whose
     // own frame fills that refresh: a repeat was a game frame to it, and each one waited out its pacing (40 fps).
-    if (present_vsync_paced() && interval > 0 && !ffx_fg_on()) {
+    if (present_vsync_paced(interval) && interval > 0 && !ffx_fg_on()) {
         const int repeats = std::max(1, int(std::lround(double(interval) * plat::display_refresh_hz() / 60.0))) - 1;
         for (int k = 0; k < repeats && g_swapchain && !plat::window_minimized(); k++)
             present_image(crop, [&](VkCommandBuffer, bool& real) {

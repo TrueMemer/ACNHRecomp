@@ -6,6 +6,7 @@
 #
 # usage: tools/build_android.sh [--install] [--jobs N] [--no-game]
 #   --no-game: the app only, without the game set up here (what a release carries)
+#   --pixel: a release APK that upgrades the fork's previous Pixel profiling app
 #   the Vulkan headers: private/third_party/Vulkan-Headers-1.4.357 (tools/setup_acnh.sh; the NDK's are older than
 #   what the runtime calls)
 #   needs: Android SDK with ndk;28.2.13676358, build-tools;35.0.0, platforms;android-35 (ANDROID_SDK_ROOT, default
@@ -41,11 +42,13 @@ if [ -z "${JOBS:-}" ]; then
   [ "$JOBS" -lt 1 ] && JOBS=1
 fi
 GAMELIB=1
+PIXEL_APK=0
 while [ $# -gt 0 ]; do
   case $1 in
     --install) INSTALL=1 ;;
     --jobs) JOBS=$2; shift ;;
     --no-game) GAMELIB=0 ;;
+    --pixel) PIXEL_APK=1 ;;
     *) echo "unknown option $1"; exit 1 ;;
   esac
   shift
@@ -60,6 +63,7 @@ elif [ ! -d "$GEN/main" ]; then
   echo "the game is not set up on this computer (python3 tools/setup_acnh.py --game <folder>); --no-game: the app only"
   exit 1
 fi
+[ "$PIXEL_APK" = 0 ] || OUT="$OUT-pixel"
 mkdir -p "$(dirname "$OUT")"
 
 echo "== configure ($BUILD)"
@@ -96,7 +100,21 @@ TURNIP=private/third_party/mesa/build-android/src/freedreno/vulkan/libvulkan_fre
 [ -f "$TURNIP" ] && cp "$TURNIP" "$OUT/lib/arm64-v8a/" || echo "(no Turnip: tools/build_turnip.sh; the phone's driver is used)"
 # The icons are in git: drawn again only when missing (each Pillow writes other bytes for the same pixels).
 [ -f android/res/mipmap-xxxhdpi/ic_launcher.png ] || python3 tools/make_android_icon.py 2>/dev/null || true
-"$BT/aapt2" compile --dir android/res -o "$OUT/res.zip"
+MANIFEST=android/AndroidManifest.xml
+RESOURCES=android/res
+LINK_FLAGS=()
+if [ "$PIXEL_APK" = 1 ]; then
+  # Keep the old package identity so Android can update it and retain the selected game folder.
+  PACKAGE=io.github.acnhrecomp.trace
+  MANIFEST="$OUT/AndroidManifest.xml"
+  RESOURCES="$OUT/res"
+  sed 's/android:label="ACNH Recomp"/android:label="ACNH Recomp Pixel"/' android/AndroidManifest.xml > "$MANIFEST"
+  cp -R android/res "$RESOURCES"
+  sed "s/targetPackage=\"io\.github\.acnhrecomp\"/targetPackage=\"$PACKAGE\"/" \
+    android/res/xml/shortcuts.xml > "$RESOURCES/xml/shortcuts.xml"
+  LINK_FLAGS=(--rename-manifest-package "$PACKAGE")
+fi
+"$BT/aapt2" compile --dir "$RESOURCES" -o "$OUT/res.zip"
 # The version comes from the git tag (v0.7.0 -> versionName 0.7.0, versionCode 700), so Android and app stores
 # such as Obtainium see the real release number.
 VNAME=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//'); VNAME=${VNAME:-0.0.0}
@@ -105,7 +123,7 @@ VNAME=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//'); VNAME=${VNAM
 IFS=. read -r VMAJ VMIN VPAT <<<"${VNAME%%-*}"
 VCODE=$(( ${VMAJ:-0} * 10000 + ${VMIN:-0} * 100 + ${VPAT:-0} ))
 echo "APK version $VNAME ($VCODE)"
-"$BT/aapt2" link -o "$OUT/base.apk" --manifest android/AndroidManifest.xml -I "$PLATFORM" "$OUT/res.zip" \
+"$BT/aapt2" link -o "$OUT/base.apk" --manifest "$MANIFEST" -I "$PLATFORM" "$OUT/res.zip" "${LINK_FLAGS[@]}" \
   --version-name "$VNAME" --version-code "$VCODE" --replace-version
 # The pt-BR translation and the SpeedFix files as assets, which the app copies into the game folder (mod_fetch.cpp).
 rm -rf "${OUT:?}/assets"

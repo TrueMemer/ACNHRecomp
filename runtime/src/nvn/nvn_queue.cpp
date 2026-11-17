@@ -584,7 +584,7 @@ void pace_present(int interval) {
     if (off || interval <= 0) return;
     if (g_frame < fast_until) interval = 1;
     set_present_interval(interval);  // also when paced by vsync: vblank_hold (hle_vi.cpp) holds each image this long
-    if (present_vsync_paced()) return;
+    if (present_vsync_paced(interval)) return;
     uint64_t now = plat::monotonic_ns();
     if (next > now) plat::sleep_ns(next - now), now = plat::monotonic_ns();
     static uint64_t presents = 0, at2 = 0;  // how often the game asks for 30 fps (interval 2), per 600 presents
@@ -601,6 +601,7 @@ void QueuePresentTexture(CPU& c) {
     uint64_t t_in = plat::monotonic_ns();
     static uint64_t last_in = 0, prev_in_present = 0;
     uint64_t t_queue = 0, t_paced = 0;
+    int interval = 0;
     tl("present>");
     {
         static thread_local bool marked = false;
@@ -624,18 +625,18 @@ void QueuePresentTexture(CPU& c) {
         // At most two presents queued: the game runs at most two frames ahead of the replay.
         static uint64_t queued[2] = {};
         static int next_slot = 0;
+        interval = w->interval;
         uint64_t q0 = plat::monotonic_ns();
         worker_wait(queued[next_slot]);
         t_queue = plat::monotonic_ns() - q0;
         if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) {
             uint64_t texture = w->textures[size_t(c.x[2])];
             std::array<int32_t, 4> crop{w->crop[0], w->crop[1], w->crop[2], w->crop[3]};
-            const int interval = w->interval;
             queued[next_slot] = worker_run([texture, crop, interval] { gpu_present(texture, crop.data(), interval); });
             next_slot ^= 1;
         }
         uint64_t p0 = plat::monotonic_ns();
-        pace_present(w->interval);
+        pace_present(interval);
         t_paced = plat::monotonic_ns() - p0;
     }
     // NX_FRAME_PROFILE=1: every frame of the presenting thread that took over 36 ms, taken apart: the game's work
@@ -650,7 +651,7 @@ void QueuePresentTexture(CPU& c) {
         const uint64_t now = plat::monotonic_ns(), period = last_in ? t_in - last_in : 0;
         static uint64_t slow = 0, frames = 0;
         frames++;
-        static const uint64_t slow_ns = present_vsync_paced() ? 40'000'000 : 36'000'000;
+        const uint64_t slow_ns = present_vsync_paced(interval) ? 40'000'000 : 36'000'000;
         if (period > slow_ns && work_from) {
             slow++;
             log("frame: %.1f ms: game %.1f ms (svc %.1f, longest svc %#x %.1f ms; replay waits %.1f), slot wait "
